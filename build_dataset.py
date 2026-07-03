@@ -29,7 +29,7 @@ OUT_DIR = "data/processed"
 
 
 def downcast(df):
-    float_cols = df.select_dtypes("float64").columns
+    float_cols = df.select_dtypes("float32").columns
     df[float_cols] = df[float_cols].astype("float32")
     return df
 

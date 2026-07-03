@@ -35,7 +35,7 @@ def main():
     gc.collect()
 
     # Downcast to save memory
-    for col in df.select_dtypes("float64").columns:
+    for col in df.select_dtypes("float32").columns:
         df[col] = df[col].astype("float32")
 
     out = "data/features/BTC_features.parquet"

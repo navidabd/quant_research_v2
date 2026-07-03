@@ -148,7 +148,7 @@ def vif_check(df: pd.DataFrame) -> pd.DataFrame:
         # Take first 100K rows (chronological) — preserves time order
         sample = sample.iloc[:100_000]
 
-    X = sample.values.astype("float64")
+    X = sample.values.astype("float32")
 
     vif_scores = []
     for i, feat in enumerate(CANDIDATE_FEATURES):

@@ -126,4 +126,15 @@ def build_features(book_df: pd.DataFrame, trade_df: pd.DataFrame) -> pd.DataFram
 
     grid = pd.merge_asof(grid, book_feats,  left_index=True, right_index=True, direction="backward")
     grid = pd.merge_asof(grid, trade_feats, left_index=True, right_index=True, direction="backward")
+    # Raw trade columns for fill simulation
+    trade_positions = np.where(grid["event_type"].values == "trade")[0]
+    n = len(trade_positions)
+    
+    price_arr = np.full(len(grid), np.nan)
+    size_arr  = np.full(len(grid), np.nan)
+    price_arr[trade_positions] = trade_df["price"].values[:n]
+    size_arr[trade_positions]  = trade_df["size"].values[:n]
+    
+    grid["trade_price"] = price_arr
+    grid["trade_size"]  = size_arr
     return grid
