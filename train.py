@@ -58,7 +58,17 @@ logger = logging.getLogger(__name__)
 # ── Configuration ──────────────────────────────────────────────────────
 
 HORIZONS_SEC    = [1, 3, 5, 10, 15]
-QUANTILES       = [0.10, 0.25, 0.50, 0.75, 0.90]
+QUANTILES = [0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95]
+
+# Nested intervals for fan chart calibration check
+# Each tuple: (lower_q, upper_q, label)
+INTERVALS = [
+    (0.05, 0.95, "90pct"),
+    (0.10, 0.90, "80pct"),
+    (0.20, 0.80, "60pct"),
+    (0.30, 0.70, "40pct"),
+    (0.40, 0.60, "20pct"),
+]
 N_FOLDS         = 4        # last fold = final test
 PURGE_S         = 15       # max target horizon
 EMBARGO_S       = 60       # max feature window (300s/180s removed, 60s is longest)
@@ -191,8 +201,8 @@ def make_folds(df, n_folds):
 def get_Xy(df, feats, target):
     clean = df[feats + [target]].dropna()
     return (
-        clean[feats].values.astype("float64"),
-        clean[target].values.astype("float64"),
+        clean[feats].values.astype("float32"),
+        clean[target].values.astype("float32"),
     )
 
 
@@ -326,7 +336,19 @@ def train_lgbm(X_tr, y_tr, X_va, y_va, feats):
     return row
 
 def train_quantile_xgb(X_tr, y_tr, X_va, y_va):
-    """Quantile XGBoost — gives price change range predictions."""
+    """
+    Quantile XGBoost fan chart — 11 quantile models.
+    Produces nested prediction intervals like Bollinger Bands:
+      90% band: q5  → q95
+      80% band: q10 → q90
+      60% band: q20 → q80
+      40% band: q30 → q70
+      20% band: q40 → q60
+      Median:   q50
+
+    Calibration: each interval should contain its stated % of outcomes.
+    Well-calibrated = coverage close to the interval label.
+    """
     n_val = int(len(X_tr) * 0.15)
     X_t, y_t = X_tr[:-n_val], y_tr[:-n_val]
     X_v, y_v = X_tr[-n_val:], y_tr[-n_val:]
@@ -342,10 +364,23 @@ def train_quantile_xgb(X_tr, y_tr, X_va, y_va):
         m.fit(X_t, y_t, eval_set=[(X_v, y_v)], verbose=False)
         preds[q] = m.predict(X_va)
         del m; gc.collect()
-    row = {f"q{int(q*100)}_pinball": round(pinball(y_va, preds[q], q), 6) for q in QUANTILES}
-    cov = coverage(y_va, preds[0.10], preds[0.90])
-    row["quantile_coverage_80pct"] = round(cov, 4)
-    logger.info("  Quantile     80pct_coverage=%.3f  (target=0.80)", cov)
+
+    row = {}
+    # Pinball loss per quantile
+    for q in QUANTILES:
+        row[f"q{int(q*100):02d}_pinball"] = round(pinball(y_va, preds[q], q), 6)
+
+    # Coverage for each nested interval
+    for lo, hi, label in INTERVALS:
+        cov = coverage(y_va, preds[lo], preds[hi])
+        row[f"coverage_{label}"] = round(cov, 4)
+
+    # Log all coverages
+    cov_str = "  ".join(
+        f"{label}={row[f'coverage_{label}']:.3f}"
+        for _, _, label in INTERVALS
+    )
+    logger.info("  Quantile     %s", cov_str)
     return row
 
 
@@ -470,7 +505,7 @@ def main():
                     sub["xgb_r2"].values[0]          if "xgb_r2"          in sub else np.nan,
                     sub["lgbm_r2"].values[0]          if "lgbm_r2"         in sub else np.nan,
                     sub["ridge_vif10_r2"].values[0]   if "ridge_vif10_r2"  in sub else np.nan,
-                    sub["quantile_coverage_80pct"].values[0] if "quantile_coverage_80pct" in sub else np.nan)
+                    sub["coverage_80pct"].values[0] if "coverage_80pct" in sub else np.nan)
 
     logger.info("\nFull results: data/results/BTC_results.csv")
 
