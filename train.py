@@ -20,11 +20,15 @@ Models:
 Horizons: 1s, 3s, 5s, 10s, 15s
 Folds: 4 (last fold = final test, never used for model selection)
 
+Models saved to data/models/ for fold 4 (final test fold) only.
+Load with: joblib.load("data/models/<name>_h<horizon>s.pkl")
+
 Run:
     python train.py
 """
 
 import gc
+import joblib
 import logging
 import os
 import warnings
@@ -60,8 +64,6 @@ logger = logging.getLogger(__name__)
 HORIZONS_SEC    = [1, 3, 5, 10, 15]
 QUANTILES = [0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95]
 
-# Nested intervals for fan chart calibration check
-# Each tuple: (lower_q, upper_q, label)
 INTERVALS = [
     (0.05, 0.95, "90pct"),
     (0.10, 0.90, "80pct"),
@@ -69,14 +71,15 @@ INTERVALS = [
     (0.30, 0.70, "40pct"),
     (0.40, 0.60, "20pct"),
 ]
-N_FOLDS         = 4        # last fold = final test
-PURGE_S         = 15       # max target horizon
-EMBARGO_S       = 60       # max feature window (300s/180s removed, 60s is longest)
-GAP_S           = PURGE_S + EMBARGO_S   # 75 seconds total gap
+N_FOLDS         = 4
+PURGE_S         = 15
+EMBARGO_S       = 60
+GAP_S           = PURGE_S + EMBARGO_S
 OUT_DIR         = "data/results"
-os.makedirs(OUT_DIR, exist_ok=True)
+MODEL_DIR       = "data/models"
+os.makedirs(OUT_DIR,   exist_ok=True)
+os.makedirs(MODEL_DIR, exist_ok=True)
 
-# Feature sets loaded from premodel_checks output
 FEATURES_VIF10 = [
     "vwap_dev_1s", "vwap_dev_5s", "vwap_dev_10s", "vwap_dev_30s",
     "trade_imbalance_1s", "trade_imbalance_5s",
@@ -103,7 +106,6 @@ ALL_FEATURES = [
 # ── Metrics ────────────────────────────────────────────────────────────
 
 def da(y_true, y_pred):
-    """Directional accuracy on non-zero actual moves."""
     mask = y_true != 0
     if mask.sum() == 0:
         return np.nan
@@ -124,7 +126,6 @@ def metrics(y_true, y_pred, prefix):
     }
 
 def diagnostics(y_true, y_pred, prefix):
-    """Residual diagnostics from Peng Ding framework."""
     from scipy.stats import spearmanr
     resid   = y_true - y_pred
     sample  = resid[np.random.choice(len(resid), min(5000, len(resid)), replace=False)]
@@ -141,8 +142,7 @@ def diagnostics(y_true, y_pred, prefix):
 # ── Data helpers ───────────────────────────────────────────────────────
 
 def downsample(df, h_sec):
-    """Keep rows >= h_sec apart. Removes overlapping labels."""
-    times  = df.index.astype("int64") / 1e3   # ms -> seconds
+    times  = df.index.astype("int64") / 1e3
     sel    = []
     last_t = -np.inf
     for i, t in enumerate(times):
@@ -153,39 +153,25 @@ def downsample(df, h_sec):
 
 
 def make_folds(df, n_folds):
-    """
-    Expanding-window walk-forward folds with purge+embargo gap.
-    Last fold is the final test — never used for model selection.
-
-    Structure:
-    [==TRAIN==][GAP 75s][==VAL==] for each fold
-    """
     times_s = df.index.astype("int64") / 1e3
     t_min   = times_s.min()
     t_max   = times_s.max()
     t_range = t_max - t_min
-
-    # Val windows span the last 60% of data, divided into n_folds parts
-    cuts = np.linspace(0.40, 1.00, n_folds + 1)
-
-    folds = []
+    cuts    = np.linspace(0.40, 1.00, n_folds + 1)
+    folds   = []
     for i in range(n_folds):
         train_end_t = t_min + t_range * cuts[i]
         val_start_t = train_end_t + GAP_S
         val_end_t   = t_min + t_range * cuts[i + 1]
-
         if val_start_t >= val_end_t:
             continue
-
         train_mask = times_s <= train_end_t
         val_mask   = (times_s >= val_start_t) & (times_s <= val_end_t)
-
         if train_mask.sum() < 500 or val_mask.sum() < 100:
             continue
-
         folds.append({
             "fold":       i + 1,
-            "is_test":    (i == n_folds - 1),   # last fold = final test
+            "is_test":    (i == n_folds - 1),
             "train_mask": train_mask,
             "val_mask":   val_mask,
             "n_train":    int(train_mask.sum()),
@@ -194,7 +180,6 @@ def make_folds(df, n_folds):
             "val_start":  pd.Timestamp(val_start_t, unit="s", tz="UTC").strftime("%m-%d %H:%M"),
             "val_end":    pd.Timestamp(val_end_t,   unit="s", tz="UTC").strftime("%m-%d %H:%M"),
         })
-
     return folds
 
 
@@ -206,10 +191,9 @@ def get_Xy(df, feats, target):
     )
 
 
-# ── Linear models ──────────────────────────────────────────────────────
+# ── Linear models — return (row, model) ───────────────────────────────
 
 def train_ols(X_tr, y_tr, X_va, y_va, feats, label):
-    """OLS with HAC (Newey-West) for autocorrelation in residuals."""
     X_sm    = sm.add_constant(X_tr)
     model   = sm.OLS(y_tr, X_sm).fit(cov_type="HAC", cov_kwds={"maxlags": 10})
     X_va_sm = sm.add_constant(X_va, has_constant="add")
@@ -217,15 +201,15 @@ def train_ols(X_tr, y_tr, X_va, y_va, feats, label):
     pred_va = model.predict(X_va_sm)
     coef    = pd.Series(model.params[1:], index=feats)
     top5    = ", ".join(coef.abs().sort_values(ascending=False).head(5).index.tolist())
-    row = {f"ols_{label}_r2_train": round(r2_score(y_tr, pred_tr), 4), f"ols_{label}_top5": top5}
+    row = {f"ols_{label}_r2_train": round(r2_score(y_tr, pred_tr), 4),
+           f"ols_{label}_top5": top5}
     row.update(metrics(y_va, pred_va, f"ols_{label}"))
     row.update(diagnostics(y_va, pred_va, f"ols_{label}"))
     logger.info("  OLS   [%s]  train_R2=%+.4f  val_R2=%+.4f  DA=%.3f", label,
                 row[f"ols_{label}_r2_train"], row[f"ols_{label}_r2"], row[f"ols_{label}_da"])
-    return row
+    return row, model
 
 def train_ridge(X_tr, y_tr, X_va, y_va, label):
-    """Ridge with TimeSeriesSplit CV — no temporal leakage in lambda selection."""
     model   = RidgeCV(alphas=np.logspace(-4, 4, 30), cv=TimeSeriesSplit(n_splits=3))
     model.fit(X_tr, y_tr)
     pred_va = model.predict(X_va)
@@ -233,10 +217,9 @@ def train_ridge(X_tr, y_tr, X_va, y_va, label):
     row.update(metrics(y_va, pred_va, f"ridge_{label}"))
     logger.info("  Ridge [%s]  alpha=%.4f  val_R2=%+.4f  DA=%.3f", label,
                 model.alpha_, row[f"ridge_{label}_r2"], row[f"ridge_{label}_da"])
-    return row
+    return row, model
 
 def train_lasso(X_tr, y_tr, X_va, y_va, label):
-    """Lasso with TimeSeriesSplit CV — automatic feature selection."""
     model     = LassoCV(cv=TimeSeriesSplit(n_splits=3), max_iter=2000,
                         tol=1e-2, n_jobs=-1)
     model.fit(X_tr, y_tr)
@@ -247,13 +230,12 @@ def train_lasso(X_tr, y_tr, X_va, y_va, label):
     row.update(metrics(y_va, pred_va, f"lasso_{label}"))
     logger.info("  Lasso [%s]  alpha=%.6f  nonzero=%d  val_R2=%+.4f  DA=%.3f", label,
                 model.alpha_, n_nonzero, row[f"lasso_{label}_r2"], row[f"lasso_{label}_da"])
-    return row
+    return row, model
 
 
-# ── Tree models ────────────────────────────────────────────────────────
+# ── Tree models — save_path optional, return row only ─────────────────
 
-def train_dtree(X_tr, y_tr, X_va, y_va, feats):
-    """Single decision tree — depth=3, interpretable, shows first split."""
+def train_dtree(X_tr, y_tr, X_va, y_va, feats, save_path=None):
     model   = DecisionTreeRegressor(max_depth=3, min_samples_leaf=500, random_state=42)
     model.fit(X_tr, y_tr)
     pred_va = model.predict(X_va)
@@ -264,11 +246,13 @@ def train_dtree(X_tr, y_tr, X_va, y_va, feats):
     row.update(metrics(y_va, pred_va, "dtree"))
     logger.info("  DTree        val_R2=%+.4f  DA=%.3f  first=%s",
                 row["dtree_r2"], row["dtree_da"], first)
+    if save_path:
+        joblib.dump(model, save_path)
+        logger.info("  Saved: %s", save_path)
     del model; gc.collect()
     return row
 
-def train_rf(X_tr, y_tr, X_va, y_va, feats):
-    """Random forest — 300 trees, depth=3."""
+def train_rf(X_tr, y_tr, X_va, y_va, feats, save_path=None):
     model   = RandomForestRegressor(n_estimators=300, max_depth=3,
                                      min_samples_leaf=100, n_jobs=-1, random_state=42)
     model.fit(X_tr, y_tr)
@@ -277,11 +261,13 @@ def train_rf(X_tr, y_tr, X_va, y_va, feats):
     row     = {"rf_top5": ", ".join(imp.sort_values(ascending=False).head(5).index.tolist())}
     row.update(metrics(y_va, pred_va, "rf"))
     logger.info("  RF           val_R2=%+.4f  DA=%.3f", row["rf_r2"], row["rf_da"])
+    if save_path:
+        joblib.dump(model, save_path)
+        logger.info("  Saved: %s", save_path)
     del model; gc.collect()
     return row
 
-def train_xgb(X_tr, y_tr, X_va, y_va, feats):
-    """XGBoost — depth=3, conservative regularization, early stopping."""
+def train_xgb(X_tr, y_tr, X_va, y_va, feats, save_path=None):
     n_val   = int(len(X_tr) * 0.15)
     X_t, y_t   = X_tr[:-n_val], y_tr[:-n_val]
     X_v, y_v   = X_tr[-n_val:], y_tr[-n_val:]
@@ -305,11 +291,13 @@ def train_xgb(X_tr, y_tr, X_va, y_va, feats):
     row.update(metrics(y_va, pred_va, "xgb"))
     logger.info("  XGBoost      train_R2=%+.4f  val_R2=%+.4f  DA=%.3f  trees=%d",
                 row["xgb_r2_train"], row["xgb_r2"], row["xgb_da"], row["xgb_n_trees"])
+    if save_path:
+        joblib.dump(model, save_path)
+        logger.info("  Saved: %s", save_path)
     del model; gc.collect()
     return row
 
-def train_lgbm(X_tr, y_tr, X_va, y_va, feats):
-    """LightGBM — depth=3, conservative regularization, early stopping."""
+def train_lgbm(X_tr, y_tr, X_va, y_va, feats, save_path=None):
     n_val   = int(len(X_tr) * 0.15)
     X_t, y_t   = X_tr[:-n_val], y_tr[:-n_val]
     X_v, y_v   = X_tr[-n_val:], y_tr[-n_val:]
@@ -332,23 +320,13 @@ def train_lgbm(X_tr, y_tr, X_va, y_va, feats):
     row.update(metrics(y_va, pred_va, "lgbm"))
     logger.info("  LightGBM     train_R2=%+.4f  val_R2=%+.4f  DA=%.3f  trees=%d",
                 row["lgbm_r2_train"], row["lgbm_r2"], row["lgbm_da"], row["lgbm_n_trees"])
+    if save_path:
+        joblib.dump(model, save_path)
+        logger.info("  Saved: %s", save_path)
     del model; gc.collect()
     return row
 
 def train_quantile_xgb(X_tr, y_tr, X_va, y_va):
-    """
-    Quantile XGBoost fan chart — 11 quantile models.
-    Produces nested prediction intervals like Bollinger Bands:
-      90% band: q5  → q95
-      80% band: q10 → q90
-      60% band: q20 → q80
-      40% band: q30 → q70
-      20% band: q40 → q60
-      Median:   q50
-
-    Calibration: each interval should contain its stated % of outcomes.
-    Well-calibrated = coverage close to the interval label.
-    """
     n_val = int(len(X_tr) * 0.15)
     X_t, y_t = X_tr[:-n_val], y_tr[:-n_val]
     X_v, y_v = X_tr[-n_val:], y_tr[-n_val:]
@@ -366,16 +344,11 @@ def train_quantile_xgb(X_tr, y_tr, X_va, y_va):
         del m; gc.collect()
 
     row = {}
-    # Pinball loss per quantile
     for q in QUANTILES:
         row[f"q{int(q*100):02d}_pinball"] = round(pinball(y_va, preds[q], q), 6)
-
-    # Coverage for each nested interval
     for lo, hi, label in INTERVALS:
         cov = coverage(y_va, preds[lo], preds[hi])
         row[f"coverage_{label}"] = round(cov, 4)
-
-    # Log all coverages
     cov_str = "  ".join(
         f"{label}={row[f'coverage_{label}']:.3f}"
         for _, _, label in INTERVALS
@@ -387,11 +360,13 @@ def train_quantile_xgb(X_tr, y_tr, X_va, y_va):
 # ── Per-fold per-horizon ───────────────────────────────────────────────
 
 def run_fold_horizon(df, fold, h_sec):
-    target = f"fwd_change_{h_sec}s"
+    target  = f"fwd_change_{h_sec}s"
+    is_test = fold["is_test"]
+    tag     = f"h{h_sec}s"
+
     train_df = df[fold["train_mask"]]
     val_df   = df[fold["val_mask"]]
 
-    # Sparse: rows >= h_sec apart — removes overlapping labels
     cols_needed = list(set(ALL_FEATURES + FEATURES_VIF10 + [target]))
     cols_needed = [c for c in cols_needed if c in df.columns]
 
@@ -405,10 +380,10 @@ def run_fold_horizon(df, fold, h_sec):
 
     logger.info("  h=%2ds  train_sp=%d  val_sp=%d", h_sec, len(train_sp), len(val_sp))
     row = {"horizon_s": h_sec, "fold": fold["fold"],
-           "is_test": fold["is_test"], "skipped": False,
+           "is_test": is_test, "skipped": False,
            "n_train_sparse": len(train_sp), "n_val_sparse": len(val_sp)}
 
-    # Linear pipeline (VIF10 features, standardized)
+    # ── Linear pipeline ───────────────────────────────────────────
     lin_feats = [f for f in FEATURES_VIF10 if f in df.columns]
     X_tr_l, y_tr = get_Xy(train_sp, lin_feats, target)
     X_va_l, y_va = get_Xy(val_sp,   lin_feats, target)
@@ -417,24 +392,46 @@ def run_fold_horizon(df, fold, h_sec):
     X_tr_ls = np.clip(sc.fit_transform(X_tr_l), -10, 10)
     X_va_ls = np.clip(sc.transform(X_va_l),     -10, 10)
 
-    row.update(train_ols(  X_tr_ls, y_tr, X_va_ls, y_va, lin_feats, "vif10"))
-    row.update(train_ridge(X_tr_ls, y_tr, X_va_ls, y_va, "vif10"))
-    row.update(train_lasso(X_tr_ls, y_tr, X_va_ls, y_va, "vif10"))
+    row_ols, mdl_ols = train_ols(X_tr_ls, y_tr, X_va_ls, y_va, lin_feats, "vif10")
+    row.update(row_ols)
+    if is_test:
+        joblib.dump(mdl_ols, f"{MODEL_DIR}/ols_vif10_{tag}.pkl")
+        joblib.dump(sc,      f"{MODEL_DIR}/scaler_vif10_{tag}.pkl")
+        logger.info("  Saved: ols_vif10_%s.pkl + scaler_vif10_%s.pkl", tag, tag)
 
-    # Tree pipeline (all features, no scaling)
+    row_ridge, mdl_ridge = train_ridge(X_tr_ls, y_tr, X_va_ls, y_va, "vif10")
+    row.update(row_ridge)
+    if is_test:
+        joblib.dump(mdl_ridge, f"{MODEL_DIR}/ridge_vif10_{tag}.pkl")
+        logger.info("  Saved: ridge_vif10_%s.pkl", tag)
+
+    row_lasso, mdl_lasso = train_lasso(X_tr_ls, y_tr, X_va_ls, y_va, "vif10")
+    row.update(row_lasso)
+    if is_test:
+        joblib.dump(mdl_lasso, f"{MODEL_DIR}/lasso_vif10_{tag}.pkl")
+        logger.info("  Saved: lasso_vif10_%s.pkl", tag)
+
+    # ── Tree pipeline ─────────────────────────────────────────────
     X_tr_t, y_tr_t = get_Xy(train_sp, ALL_FEATURES, target)
     X_va_t, y_va_t = get_Xy(val_sp,   ALL_FEATURES, target)
-
     X_tr_t = X_tr_t.astype("float32"); y_tr_t = y_tr_t.astype("float32")
     X_va_t = X_va_t.astype("float32"); y_va_t = y_va_t.astype("float32")
 
-    row.update(train_dtree(X_tr_t, y_tr_t, X_va_t, y_va_t, ALL_FEATURES))
-    row.update(train_rf(   X_tr_t, y_tr_t, X_va_t, y_va_t, ALL_FEATURES))
-    row.update(train_xgb(  X_tr_t, y_tr_t, X_va_t, y_va_t, ALL_FEATURES))
-    row.update(train_lgbm( X_tr_t, y_tr_t, X_va_t, y_va_t, ALL_FEATURES))
+    row.update(train_dtree(X_tr_t, y_tr_t, X_va_t, y_va_t, ALL_FEATURES,
+               save_path=f"{MODEL_DIR}/dtree_{tag}.pkl" if is_test else None))
+
+    row.update(train_rf(X_tr_t, y_tr_t, X_va_t, y_va_t, ALL_FEATURES,
+               save_path=f"{MODEL_DIR}/rf_{tag}.pkl" if is_test else None))
+
+    row.update(train_xgb(X_tr_t, y_tr_t, X_va_t, y_va_t, ALL_FEATURES,
+               save_path=f"{MODEL_DIR}/xgb_{tag}.pkl" if is_test else None))
+
+    row.update(train_lgbm(X_tr_t, y_tr_t, X_va_t, y_va_t, ALL_FEATURES,
+               save_path=f"{MODEL_DIR}/lgbm_{tag}.pkl" if is_test else None))
+
     row.update(train_quantile_xgb(X_tr_t, y_tr_t, X_va_t, y_va_t))
 
-    # Winner by val R2
+    # Winner
     r2s    = {k: v for k, v in row.items() if k.endswith("_r2") and "train" not in k}
     winner = max(r2s, key=r2s.get)
     row["winner"]    = winner.replace("_r2", "")
@@ -450,14 +447,12 @@ def main():
     logger.info("Gap: %ds (purge %ds + embargo %ds)  Folds: %d (last=test)",
                 GAP_S, PURGE_S, EMBARGO_S, N_FOLDS)
 
-    # Load features, compute targets
     logger.info("Loading features ...")
     df = pd.read_parquet("data/features/BTC_features.parquet")
     logger.info("Computing targets ...")
     df = build_targets(df)
     logger.info("Dataset: %d rows, %d columns", len(df), df.shape[1])
 
-    # Build folds
     folds = make_folds(df, N_FOLDS)
     logger.info("Folds created:")
     for f in folds:
@@ -466,7 +461,6 @@ def main():
                     f["fold"], f["train_end"], f["val_start"], f["val_end"],
                     f["n_train"], f["n_val"], marker)
 
-    # Train
     results = []
     for fold in folds:
         fold_type = "FINAL TEST" if fold["is_test"] else f"Fold {fold['fold']}"
@@ -478,12 +472,10 @@ def main():
     results_df = pd.DataFrame(results)
     results_df.to_csv(os.path.join(OUT_DIR, "BTC_results.csv"), index=False)
 
-    # Summary: CV folds (model selection) vs final test
     cv_df   = results_df[~results_df["is_test"] & ~results_df.get("skipped", False)]
     test_df = results_df[ results_df["is_test"] & ~results_df.get("skipped", False)]
 
     logger.info("\n=== CV SUMMARY (mean across folds, model selection) ===")
-    r2_cols = [c for c in results_df.columns if c.endswith("_r2") and "train" not in c and c != "winner_r2"]
     for h in HORIZONS_SEC:
         sub = cv_df[cv_df["horizon_s"] == h]
         if sub.empty: continue
@@ -502,12 +494,14 @@ def main():
         logger.info("  h=%2ds  winner=%s(%.4f)  XGB=%.4f  LGBM=%.4f  Ridge=%.4f  coverage=%.3f",
                     h,
                     sub["winner"].values[0], sub["winner_r2"].values[0],
-                    sub["xgb_r2"].values[0]          if "xgb_r2"          in sub else np.nan,
-                    sub["lgbm_r2"].values[0]          if "lgbm_r2"         in sub else np.nan,
-                    sub["ridge_vif10_r2"].values[0]   if "ridge_vif10_r2"  in sub else np.nan,
-                    sub["coverage_80pct"].values[0] if "coverage_80pct" in sub else np.nan)
+                    sub["xgb_r2"].values[0]        if "xgb_r2"          in sub else np.nan,
+                    sub["lgbm_r2"].values[0]        if "lgbm_r2"         in sub else np.nan,
+                    sub["ridge_vif10_r2"].values[0] if "ridge_vif10_r2"  in sub else np.nan,
+                    sub["coverage_80pct"].values[0] if "coverage_80pct"  in sub else np.nan)
 
     logger.info("\nFull results: data/results/BTC_results.csv")
+    logger.info("Models saved: data/models/ (fold 4 / final test only)")
+    logger.info("Load example: joblib.load('data/models/ridge_vif10_h5s.pkl')")
 
 
 if __name__ == "__main__":
